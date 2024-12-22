@@ -2,14 +2,12 @@ import torch
 import whisper
 import tempfile
 import os
-import shutil
 import cv2
 import numpy as np
 import sys
 import mediapipe as mp
 import logging
 from typing import List, Dict, Tuple
-import random
 import pyaudio
 import threading
 import wave
@@ -20,7 +18,6 @@ from models.common import DetectMultiBackend
 from utils.torch_utils import select_device
 from utils.general import non_max_suppression
 from utils.augmentations import letterbox
-from utils.plots import Annotator, colors
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -31,6 +28,8 @@ imgsz = [640, 640]
 
 mp_pose = mp.solutions.pose
 mp_face_detection = mp.solutions.face_detection
+mp_hands = mp.solutions.hands
+mp_drawing = mp.solutions.drawing_utils
 
 LEFT_ARM_CONNECTIONS = [
     (mp_pose.PoseLandmark.LEFT_SHOULDER, mp_pose.PoseLandmark.LEFT_ELBOW),
@@ -54,8 +53,7 @@ def caesar_cipher_encrypt(text: str, shift: int = 3) -> str:
             encrypted += char
     return encrypted
 
-def overlay_text(frame: np.ndarray, text: str, position: Tuple[int, int], font_scale: float = 0.4,
-                color: Tuple[int, int, int] = (255, 255, 255), thickness: int = 1) -> None:
+def overlay_text(frame: np.ndarray, text: str, position: Tuple[int, int], font_scale: float = 0.4, color: Tuple[int, int, int] = (255, 255, 255), thickness: int = 1) -> None:
     font = cv2.FONT_HERSHEY_SIMPLEX
     lines = text.split('\n')
     x, y = position
@@ -64,8 +62,7 @@ def overlay_text(frame: np.ndarray, text: str, position: Tuple[int, int], font_s
         text_size, _ = cv2.getTextSize(line, font, font_scale, thickness)
         text_w, text_h = text_size
         overlay = frame.copy()
-        cv2.rectangle(overlay, (x, y - text_h - 5 + i*line_height),
-                      (x + text_w + 5, y + 5 + i*line_height), (0, 0, 0), -1)
+        cv2.rectangle(overlay, (x, y - text_h - 5 + i*line_height), (x + text_w + 5, y + 5 + i*line_height), (0, 0, 0), -1)
         alpha = 0.6
         cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
         cv2.putText(frame, line, (x, y + i*line_height), font, font_scale, color, thickness, cv2.LINE_AA)
@@ -105,7 +102,6 @@ def detect_and_capture_faces(frame: np.ndarray, person_boxes: List[Tuple[int, in
                 if face_img.size == 0:
                     continue
                 face_images.append(face_img)
-                cv2.rectangle(frame, (fx1, fy1), (fx2, fy2), (255, 0, 0), 2)
     return frame, face_images
 
 def detect_pose_on_frame_custom(frame: np.ndarray, results_pose) -> np.ndarray:
@@ -118,31 +114,37 @@ def detect_pose_on_frame_custom(frame: np.ndarray, results_pose) -> np.ndarray:
     for idx, lm in enumerate(landmarks):
         x, y = get_coords(lm)
         cv2.circle(frame, (x, y), 4, (200, 200, 200), -1)
-    NEUTRAL_COLOR = (100, 100, 100)
+    c = (100, 100, 100)
     for conn in mp_pose.POSE_CONNECTIONS:
         if conn in LEFT_ARM_CONNECTIONS or conn in RIGHT_ARM_CONNECTIONS:
             continue
-        start_idx, end_idx = conn
-        start = landmarks[start_idx]
-        end = landmarks[end_idx]
+        s, e = conn
+        start = landmarks[s]
+        end = landmarks[e]
         x1, y1 = get_coords(start)
         x2, y2 = get_coords(end)
-        cv2.line(frame, (x1, y1), (x2, y2), NEUTRAL_COLOR, 2)
-    LEFT_ARM_COLOR = (255, 50, 50)
-    RIGHT_ARM_COLOR = (50, 255, 50)
-    ARM_LINE_THICKNESS = 5
+        cv2.line(frame, (x1, y1), (x2, y2), c, 2)
+    c1 = (255, 50, 50)
+    c2 = (50, 255, 50)
+    t = 5
     for (s, e) in LEFT_ARM_CONNECTIONS:
         start = landmarks[s]
         end = landmarks[e]
         x1, y1 = get_coords(start)
         x2, y2 = get_coords(end)
-        cv2.line(frame, (x1, y1), (x2, y2), LEFT_ARM_COLOR, ARM_LINE_THICKNESS)
+        cv2.line(frame, (x1, y1), (x2, y2), c1, t)
     for (s, e) in RIGHT_ARM_CONNECTIONS:
         start = landmarks[s]
         end = landmarks[e]
         x1, y1 = get_coords(start)
         x2, y2 = get_coords(end)
-        cv2.line(frame, (x1, y1), (x2, y2), RIGHT_ARM_COLOR, ARM_LINE_THICKNESS)
+        cv2.line(frame, (x1, y1), (x2, y2), c2, t)
+    return frame
+
+def draw_hands_on_frame(frame: np.ndarray, results_hands) -> np.ndarray:
+    if results_hands.multi_hand_landmarks:
+        for hand_landmarks in results_hands.multi_hand_landmarks:
+            mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS, mp_drawing.DrawingSpec(color=(0, 0, 255), thickness=2, circle_radius=3), mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2))
     return frame
 
 def add_subtitles(frame: np.ndarray, segments: List[Dict], current_time_ms: float) -> None:
@@ -155,18 +157,17 @@ def add_subtitles(frame: np.ndarray, segments: List[Dict], current_time_ms: floa
             subtitle_text = text.strip()
             break
     if subtitle_text:
-        text = subtitle_text
         font = cv2.FONT_HERSHEY_SIMPLEX
         font_scale = 1
         thickness = 2
-        (text_w, text_h), _ = cv2.getTextSize(text, font, font_scale, thickness)
+        (text_w, text_h), _ = cv2.getTextSize(subtitle_text, font, font_scale, thickness)
         x = 50
         y = frame.shape[0] - 50
         overlay = frame.copy()
         cv2.rectangle(overlay, (x - 10, y - text_h - 10), (x + text_w + 10, y + 10), (0, 0, 0), -1)
         alpha = 0.5
         cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
-        cv2.putText(frame, text, (x, y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+        cv2.putText(frame, subtitle_text, (x, y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
 
 def save_faces(face_images: List[np.ndarray], output_dir: str, frame_count: int) -> None:
     if not os.path.exists(output_dir):
@@ -180,40 +181,11 @@ def place_detected_faces(frame: np.ndarray, face_images: List[np.ndarray], width
         face = cv2.resize(face, (100, 100))
         if side == 'right':
             x_offset = width - 120
-        elif side == 'left':
-            x_offset = 20
         else:
-            raise ValueError(f"Invalid side value: {side}")
+            x_offset = 20
         y_offset = 10 + (110 * idx)
         if y_offset + 100 <= height:
             frame[y_offset:y_offset + 100, x_offset:x_offset + 100] = face
-
-def load_reference_images(image_dir: str) -> List[np.ndarray]:
-    faces = []
-    if os.path.exists(image_dir):
-        for fname in os.listdir(image_dir):
-            if fname.lower().endswith(('.png', '.jpg', '.jpeg')):
-                img_path = os.path.join(image_dir, fname)
-                img = cv2.imread(img_path)
-                if img is not None:
-                    gray_img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-                    detected_faces = face_cascade.detectMultiScale(gray_img, scaleFactor=1.1, minNeighbors=5)
-                    for (x, y, w, h) in detected_faces:
-                        face_img = img[y:y + h, x:x + w]
-                        faces.append(face_img)
-    return faces
-
-def load_reference_objects(object_dir: str) -> Dict[str, np.ndarray]:
-    ref_objects = {}
-    if os.path.exists(object_dir):
-        for fname in os.listdir(object_dir):
-            if fname.lower().endswith(('.png', '.jpg', '.jpeg')):
-                class_name = os.path.splitext(fname)[0]
-                obj_img = cv2.imread(os.path.join(object_dir, fname))
-                if obj_img is not None:
-                    ref_objects[class_name.lower()] = obj_img
-    return ref_objects
 
 def detect_objects_on_frame(frame: np.ndarray) -> List[Tuple[str, Tuple[int, int, int, int]]]:
     img = letterbox(frame, imgsz, stride=32, auto=True)[0]
@@ -233,30 +205,21 @@ def detect_objects_on_frame(frame: np.ndarray) -> List[Tuple[str, Tuple[int, int
         pad_h = (h - h0 * gain) / 2
         for *box, conf, cls in pred[0]:
             cls_name = yolo_model.names[int(cls)].lower()
-            if cls_name != 'person':
-                continue
-            x1, y1, x2, y2 = box
-            x1 = (x1 - pad_w) / gain
-            y1 = (y1 - pad_h) / gain
-            x2 = (x2 - pad_w) / gain
-            y2 = (y2 - pad_h) / gain
-            x1, y1, x2, y2 = map(int, (x1, y1, x2, y2))
-            x1 = max(0, min(x1, w0 - 1))
-            y1 = max(0, min(y1, h0 - 1))
-            x2 = max(0, min(x2, w0 - 1))
-            y2 = max(0, min(y2, h0 - 1))
-            if x2 <= x1 or y2 <= y1:
-                continue
-            detections.append((cls_name, (x1, y1, x2, y2)))
+            if cls_name == 'person':
+                x1, y1, x2, y2 = box
+                x1 = (x1 - pad_w) / gain
+                y1 = (y1 - pad_h) / gain
+                x2 = (x2 - pad_w) / gain
+                y2 = (y2 - pad_h) / gain
+                x1, y1, x2, y2 = map(int, (x1, y1, x2, y2))
+                x1 = max(0, min(x1, w0 - 1))
+                y1 = max(0, min(y1, h0 - 1))
+                x2 = max(0, min(x2, w0 - 1))
+                y2 = max(0, min(y2, h0 - 1))
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                detections.append((cls_name, (x1, y1, x2, y2)))
     return detections
-
-def place_reference_objects(frame: np.ndarray, objects_images: List[np.ndarray], width: int, height: int) -> None:
-    for idx, obj_img in enumerate(objects_images):
-        obj_img = cv2.resize(obj_img, (100, 100))
-        x_offset = 20
-        y_offset = 10 + (110 * idx)
-        if y_offset + 100 <= height:
-            frame[y_offset:y_offset + 100, x_offset:x_offset + 100] = obj_img
 
 def audio_transcription(audio_buffer, segments, lock, channels, rate):
     buffer = bytearray()
@@ -292,17 +255,12 @@ def start_audio_capture(audio_buffer, lock, sample_format, channels, rate, chunk
             audio_buffer.append(in_data)
         return (None, pyaudio.paContinue)
     p = pyaudio.PyAudio()
-    stream = p.open(format=sample_format,
-                    channels=channels,
-                    rate=rate,
-                    input=True,
-                    frames_per_buffer=chunk,
-                    stream_callback=callback)
+    stream = p.open(format=sample_format, channels=channels, rate=rate, input=True, frames_per_buffer=chunk, stream_callback=callback)
     stream.start_stream()
     return p, stream
 
-def process_webcam(segments: List[Dict], pose, face_detector):
-    cap = cv2.VideoCapture(0)  
+def process_webcam(segments: List[Dict], pose, face_detector, hands):
+    cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         raise IOError("Не удалось открыть вебкамеру")
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
@@ -311,11 +269,6 @@ def process_webcam(segments: List[Dict], pose, face_detector):
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter('output.mp4', fourcc, fps, (width, height))
     face_output_dir = 'extracted_faces'
-    object_output_dir = 'extracted_object'
-    reference_object_dir = 'extracted_object'
-    reference_image_dir = 'extracted_faces'
-    reference_objects = load_reference_objects(object_output_dir)
-    extracted_faces = load_reference_images(reference_image_dir)
     frame_count = 0
     try:
         while True:
@@ -329,28 +282,14 @@ def process_webcam(segments: List[Dict], pose, face_detector):
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results_pose = pose.process(rgb_frame)
             frame = detect_pose_on_frame_custom(frame, results_pose)
+            results_hands = hands.process(rgb_frame)
+            frame = draw_hands_on_frame(frame, results_hands)
             current_time_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
             add_subtitles(frame, segments, current_time_ms)
             if face_images:
                 save_faces(face_images, face_output_dir, frame_count)
-                place_detected_faces(frame, face_images, width, height)
-            if extracted_faces:
-                place_detected_faces(frame, extracted_faces, width, height, side='left')
-            matched_objects_images = []
-            for cls_name, (x1, y1, x2, y2) in objects_found:
-                color = (0, 255, 0)
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                cv2.putText(frame, cls_name, (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-                if cls_name in reference_objects:
-                    matched_objects_images.append(reference_objects[cls_name])
-            if matched_objects_images:
-                place_reference_objects(frame, matched_objects_images, width, height)
-            technical_data = [
-                "f/2.8",
-                "1/200s",
-                "100",
-                "50mm"
-            ]
+                place_detected_faces(frame, face_images, width, height, side='right')
+            technical_data = ["f/2.8","1/200s","ISO 100","50mm"]
             for idx, data in enumerate(technical_data):
                 overlay_text(frame, data, (width - 200, height - 20 - idx*20), font_scale=0.5, color=(0, 255, 255), thickness=1)
             cv2.imshow('Webcam Feed', frame)
@@ -374,14 +313,17 @@ def main():
         audio_thread = threading.Thread(target=audio_transcription, args=(audio_buffer, segments, lock, channels, rate), daemon=True)
         audio_thread.start()
         p, stream = start_audio_capture(audio_buffer, lock, sample_format, channels, rate, chunk)
-        with mp_pose.Pose(min_detection_confidence=0.5) as pose, mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5) as face_detector:
-            process_webcam(segments, pose, face_detector)
+        with mp_pose.Pose(min_detection_confidence=0.5) as pose, mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5) as face_detector, mp_hands.Hands(static_image_mode=False, max_num_hands=2, min_detection_confidence=0.5, min_tracking_confidence=0.5) as hands:
+            process_webcam(segments, pose, face_detector, hands)
     except Exception as e:
         logging.error(f'Не удалось обработать видео: {str(e)}')
     finally:
-        stream.stop_stream()
-        stream.close()
-        p.terminate()
+        try:
+            stream.stop_stream()
+            stream.close()
+            p.terminate()
+        except:
+            pass
         cv2.destroyAllWindows()
 
 if __name__ == "__main__":
