@@ -2,9 +2,9 @@
 
 <div align="center">
   <h4>
-    <a href="https://github.com/Solrikk/DeepWatch/blob/main/README.md">⭐English⭐</a> |
+    <a href="https://github.com/Solrikk/DeepWatch/blob/main/README.md">English</a> |
     <a href="https://github.com/Solrikk/DeepWatch/blob/main/docs/readme/README_JP.md">日本語</a> |
-    <a href="https://github.com/Solrikk/DeepWatch/blob/main/docs/readme/README_RU.md">Русский</a> |
+    <a href="https://github.com/Solrikk/DeepWatch/blob/main/docs/readme/README_RU.md">⭐Русский⭐</a> |
     <a href="https://github.com/Solrikk/DeepWatch/blob/main/docs/readme/README_FR.md">Français</a> |
     <a href="https://github.com/Solrikk/DeepWatch/blob/main/docs/readme/README_GE.md">Deutsch</a> |
     <a href="https://github.com/Solrikk/DeepWatch/blob/main/docs/readme/README_AR.md">العربية</a> |
